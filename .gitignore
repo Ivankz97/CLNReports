@@ -1,0 +1,10 @@
+# Archivos de Python
+__pycache__/
+*.pyc
+
+# Directorio de ChromaDB
+culiacan_incidentes_db/
+
+# Archivos de entorno y secretos locales
+.env
+.streamlit/secrets.toml
