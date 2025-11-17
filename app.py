@@ -7,32 +7,36 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain_core.documents import Document
 from urllib.parse import quote_plus 
 import streamlit as st
+from datetime import datetime # Imported for date sorting
 
-# --- 1. Initialize Components
+# --- 1. Component Initialization (Caching and Security) ---
 
 PERSIST_DIRECTORY = "./culiacan_incidentes_db"
 
 @st.cache_resource
 def initialize_system():
-    """Initialize LLM, Embeddings and Chroma"""
+    """Initializes LLM, Embeddings, and Chroma DB (Load or Create)."""
     
+    # Securely read the API key from Streamlit secrets
     try:
         api_key = st.secrets["google_api_key"]
     except KeyError:
-        raise KeyError("The 'google_api_key' is not configured in the Secrets Streamlit")
+        raise KeyError("The 'google_api_key' is not configured in Streamlit secrets. Check your configuration!")
 
     try:
-        # Send keys to LangChain Constructors
+        # Pass the key to LangChain constructors
         embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key)
         llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key) 
 
     except Exception as e:
-        raise ConnectionError(f"Connection failed. Error: {e}")
+        raise ConnectionError(f"Google connection failed. Error: {e}")
 
-    # B. Vector Store (Load or creation of ChromaDB)
+    # B. Vector Store (Load or Create ChromaDB)
     if os.path.exists(PERSIST_DIRECTORY) and os.listdir(PERSIST_DIRECTORY):
+        # Load existing database
         vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embeddings)
     else:
+        # Create initial sample data
         initial_incidents = [
             "Incidente: Semáforo dañado. Ubicación: Av. Obregón, Culiacán. Fecha: 2025-11-01",
             "Incidente: Hoyo en el pavimento. Ubicación: Malecón Nuevo, Culiacán. Se requiere bacheo. Fecha: 2025-10-28",
@@ -49,6 +53,7 @@ def initialize_system():
         )
         vectorstore.persist() 
     
+    # Configure retriever for similarity search
     retriever = vectorstore.as_retriever(search_kwargs={"k": 5}) 
     
     return llm, vectorstore, retriever
@@ -62,115 +67,176 @@ except (KeyError, ConnectionError) as e:
     st.stop()
 
 
-# C. LLM ROL FOR LOCATION EXTRACTION
+# C. LLM ROLE FOR LOCATION EXTRACTION
 LOCATION_EXTRACTOR_ROLE = SystemMessage(
     content="Eres un extractor de texto. Tu única tarea es analizar el mensaje del usuario e identificar la ubicación específica. Responde ESTRICTAMENTE con un objeto JSON válido, **encerrando la respuesta SÓLO dentro de triple backtick y la palabra 'json'** (ejemplo: ```json{\"ubicacion\": \"valor\"}```). La ubicación debe ser el nombre del lugar, seguido de ', Culiacán' para mayor precisión. Si no detectas una ubicación válida, responde estrictamente con el JSON: ```json{\"ubicacion\": \"NO_UBICACION\"}```"
 )
 
-# --- 2. Utility functions ---
+# --- 2. Utility Functions ---
 
 def get_osm_search_link(location_name):
-    """Generate the URL for OpenStreetMap."""
+    """Generates the URL for OpenStreetMap search."""
     search_query = quote_plus(location_name)
     return f"https://www.openstreetmap.org/search?query={search_query}"
 
-def extract_location_from_report(report_text, default_location):
-    """Extract saved location from reports"""
+def extract_location_from_report(report_text):
+    """Extracts the saved location from the report using regex."""
     match = re.search(r"Ubicación:\s*(.+?)\.\s*Fecha:", report_text)
-    return match.group(1).strip() if match else default_location
+    return match.group(1).strip() if match else "Ubicación Desconocida"
+
+def extract_date_from_report(report_text):
+    """Extracts the date (YYYY-MM-DD) from the report content."""
+    match = re.search(r"Fecha:\s*(\d{4}-\d{2}-\d{2})", report_text)
+    return match.group(1).strip() if match else None
+
+def get_recent_reports(vectorstore, top_n=10):
+    """Retrieves all reports, sorts them by date, and returns the top N most recent."""
+    
+    # Access the underlying Chroma collection directly to retrieve all documents.
+    try:
+        results = vectorstore._collection.get(
+            include=['documents'] 
+        )
+    except AttributeError:
+        st.error("Error accessing the internal Chroma collection.")
+        return []
+
+    reports = []
+    for doc_id, doc_content in zip(results['ids'], results['documents']):
+        date_str = extract_date_from_report(doc_content)
+        if date_str:
+            try:
+                # Convert date string to datetime object for sorting
+                reports.append({
+                    'content': doc_content,
+                    'date': datetime.strptime(date_str, '%Y-%m-%d')
+                })
+            except ValueError:
+                continue # Skip documents with incorrect date format
+    
+    # Sort by date descending (most recent first)
+    reports.sort(key=lambda x: x['date'], reverse=True)
+    
+    return reports[:top_n]
 
 
-# --- 3. Main logic for Streamlit ---
+# --- 3. Main Streamlit Logic ---
 
 st.title("🚨 Sistema de Gestión de Incidentes de Culiacán")
+st.markdown("Usa Gemini para la extracción y ChromaDB para la memoria persistente.")
 
 st.sidebar.header("Opciones")
-choice = st.sidebar.radio("Elige una acción:", ('📝 Reportar Incidente', '🔍 Consultar Incidentes'))
+# Radio button for choosing action
+choice = st.sidebar.radio("Elige una acción:", ('📝 Reportar Incidente', '🔍 Consultar Incidentes', '📅 Ver Reportes Recientes'))
 
-user_input = st.text_area(
-    "Ingresa la descripción y ubicación del incidente (ej. Choque en Av. Obregón)", 
-    key="main_input",
-    height=100
-)
-
-if st.button("Procesar Solicitud", type="primary"):
+# --- Input Block (Applies only to Reporting/Consulting) ---
+if choice in ('📝 Reportar Incidente', '🔍 Consultar Incidentes'):
+    user_input = st.text_area(
+        "Ingresa la descripción y ubicación del incidente", 
+        key="main_input",
+        height=100
+    )
     
-    if not user_input:
-        st.warning("Por favor, ingresa una descripción para procesar.")
-        st.stop()
-
-    # 1. Get Location
-    try:
-        location_messages = [LOCATION_EXTRACTOR_ROLE, HumanMessage(content=user_input)]
+    if st.button("Procesar Solicitud", type="primary"):
         
-        with st.spinner('🌎 Buscando ubicación con Gemini...'):
-            location_json_str = llm.invoke(location_messages).content
-
-        # CLEAN AND JSON PARSER
-        cleaned_json_str = location_json_str.strip()
-        if cleaned_json_str.startswith("```json"):
-            cleaned_json_str = cleaned_json_str[7:]
-        if cleaned_json_str.endswith("```"):
-            cleaned_json_str = cleaned_json_str[:-3]
-        
-        try:
-            location_data = json.loads(cleaned_json_str.strip())
-        except json.JSONDecodeError:
-            location_data = {'ubicacion': 'NO_UBICACION'}
-            
-        if location_data['ubicacion'] == 'NO_UBICACION':
-            st.error("🚨 ERROR: No se pudo detectar una ubicación válida en Culiacán. Intenta ser más específico.")
+        if not user_input:
+            st.warning("Por favor, ingresa una descripción para procesar.")
             st.stop()
-        
-        ubicacion_detectada = location_data['ubicacion']
-        st.info(f"🔎 Ubicación detectada: **{ubicacion_detectada}**")
 
-        
-        # --- OPTION 1: REPORT ---
-        if choice == '📝 Reportar Incidente':
-            incident_report = f"Incidente: {user_input}. Ubicación: {ubicacion_detectada}. Fecha: {os.environ.get('CURRENT_DATE', '2025-11-05')}"
+        # 1. Location Extraction
+        try:
+            location_messages = [LOCATION_EXTRACTOR_ROLE, HumanMessage(content=user_input)]
             
-            with st.spinner('💾 Guardando reporte en ChromaDB...'):
-                vectorstore.add_texts([incident_report])
-                vectorstore.persist() 
-            st.success(f"✅ ¡Incidente reportado con éxito! **{ubicacion_detectada}** ha sido añadido a la memoria.")
+            with st.spinner('🌎 Buscando ubicación con Gemini...'):
+                location_json_str = llm.invoke(location_messages).content
 
-        # --- OPTION 2: Search---
-        elif choice == '🔍 Consultar Incidentes':
-            st.subheader(f"Resultados de la consulta cerca de '{ubicacion_detectada}'")
+            # JSON cleaning and parsing logic
+            cleaned_json_str = location_json_str.strip()
+            if cleaned_json_str.startswith("```json"):
+                cleaned_json_str = cleaned_json_str[7:]
+            if cleaned_json_str.endswith("```"):
+                cleaned_json_str = cleaned_json_str[:-3]
             
-            with st.spinner('🔍 Buscando reportes similares en la memoria...'):
-                retrieved_documents = retriever.invoke(user_input)
-            
-            if retrieved_documents:
+            try:
+                location_data = json.loads(cleaned_json_str.strip())
+            except json.JSONDecodeError:
+                location_data = {'ubicacion': 'NO_UBICACION'}
                 
-                main_report = retrieved_documents[0]
-                location_for_map = extract_location_from_report(main_report.page_content, ubicacion_detectada)
-                osm_link = get_osm_search_link(location_for_map)
-                
-                # Results
-                st.markdown("---")
-                st.markdown(f"**🥇 Reporte más relevante encontrado:**")
-                st.code(main_report.page_content, language='text')
-
-                st.subheader("🗺️ Visualización de Mapa (OpenStreetMap)")
-                st.markdown(f"Busca la ubicación más relevante: **`{location_for_map}`**")
-                st.link_button("Abrir Mapa en Navegador", osm_link)
-
-                if len(retrieved_documents) > 1:
-                     st.markdown("---")
-                     st.markdown(f"**Otros {len(retrieved_documents) - 1} reportes relacionados:**")
-                     for i, doc in enumerate(retrieved_documents[1:]):
-                        st.markdown(f"- **Reporte #{i+2}:** `{doc.page_content[:90]}...`")
-            else:
-                st.warning("No se encontraron incidentes cercanos a esa ubicación en la memoria.")
+            if location_data['ubicacion'] == 'NO_UBICACION':
+                st.error("🚨 ERROR: No se pudo detectar una ubicación válida en Culiacán. Intenta ser más específico.")
+                st.stop()
             
+            ubicacion_detectada = location_data['ubicacion']
+            st.info(f"🔎 Ubicación detectada: **{ubicacion_detectada}**")
 
-    except Exception as e:
-        st.error(f"🛑 Se produjo un error: {e}")
-        st.stop()
+            
+            # --- Logic for Option 1: REPORT ---
+            if choice == '📝 Reportar Incidente':
+                # Use current date for the report
+                current_date = datetime.now().strftime('%Y-%m-%d')
+                incident_report = f"Incidente: {user_input}. Ubicación: {ubicacion_detectada}. Fecha: {current_date}"
+                
+                with st.spinner('💾 Guardando reporte en ChromaDB...'):
+                    vectorstore.add_texts([incident_report])
+                    vectorstore.persist() 
+                st.success(f"✅ ¡Incidente reportado con éxito! Fecha: **{current_date}**")
 
-# Save to Chroma if something has changed
+            # --- Logic for Option 2: CONSULT ---
+            elif choice == '🔍 Consultar Incidentes':
+                st.subheader(f"Resultados de la consulta cerca de '{ubicacion_detectada}'")
+                
+                with st.spinner('🔍 Buscando reportes similares en la memoria...'):
+                    retrieved_documents = retriever.invoke(user_input)
+                
+                if retrieved_documents:
+                    main_report = retrieved_documents[0]
+                    location_for_map = extract_location_from_report(main_report.page_content)
+                    osm_link = get_osm_search_link(location_for_map)
+                    
+                    # Displaying the most relevant result
+                    st.markdown("---")
+                    st.markdown(f"**🥇 Reporte más relevante encontrado:**")
+                    st.code(main_report.page_content, language='text')
+
+                    st.subheader("🗺️ Visualización de Mapa (OpenStreetMap)")
+                    st.markdown(f"Busca la ubicación más relevante: **`{location_for_map}`**")
+                    st.link_button("Abrir Mapa en Navegador", osm_link)
+
+                    # Displaying other related results
+                    if len(retrieved_documents) > 1:
+                         st.markdown("---")
+                         st.markdown(f"**Otros {len(retrieved_documents) - 1} reportes relacionados:**")
+                         for i, doc in enumerate(retrieved_documents[1:]):
+                            st.markdown(f"- **Reporte #{i+2}:** `{doc.page_content[:90]}...`")
+                else:
+                    st.warning("No se encontraron incidentes cercanos a esa ubicación en la memoria.")
+                
+
+        except Exception as e:
+            st.error(f"🛑 Se produjo un error: {e}")
+            st.stop()
+
+# --- Logic for Option 3: RECENT REPORTS ---
+elif choice == '📅 Ver Reportes Recientes':
+    st.header("📅 Reportes Más Recientes (Top 10)")
+    
+    with st.spinner('⏳ Recuperando y ordenando todos los reportes...'):
+        recent_reports = get_recent_reports(vectorstore, top_n=10)
+    
+    if recent_reports:
+        for i, report in enumerate(recent_reports):
+            date_str = report['date'].strftime('%Y-%m-%d')
+            
+            # Clean content for display (remove redundant date text)
+            content_display = report['content'].replace(f' Fecha: {date_str}', '')
+            
+            st.markdown(f"**{i+1}.** **Fecha:** **`{date_str}`** | **Contenido:** {content_display}")
+            st.markdown("---")
+    else:
+        st.info("No se encontraron reportes en la base de datos.")
+
+
+# Ensures Chroma persists data upon completion/exit of the Streamlit session
 if 'vectorstore' in locals():
     try:
         vectorstore.persist()
