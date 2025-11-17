@@ -13,53 +13,53 @@ from datetime import datetime # Imported for date sorting
 
 PERSIST_DIRECTORY = "./culiacan_incidentes_db"
 
+# We pass the cache function itself to use its clear() method later
 @st.cache_resource
 def initialize_system():
-    """Initializes LLM, Embeddings, and Chroma DB (Load or Create)."""
+  """Initializes LLM, Embeddings, and Chroma DB (Load or Create)."""
+  # Securely read the API key from Streamlit secrets
+  try:
+    api_key = st.secrets["google_api_key"]
+  except KeyError:
+    raise KeyError("The 'google_api_key' is not configured in Streamlit secrets. Check your configuration!")
+
+  try:
+    # Pass the key to LangChain constructors
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key) 
+
+  except Exception as e:
+    raise ConnectionError(f"Google connection failed. Error: {e}")
+
+  # B. Vector Store (Load or Create ChromaDB)
+  if os.path.exists(PERSIST_DIRECTORY) and os.listdir(PERSIST_DIRECTORY):
+    # Load existing database
+    vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embeddings)
+  else:
+    # Create initial sample data
+    initial_incidents = [
+      "Incidente: Semáforo dañado. Ubicación: Av. Obregón, Culiacán. Fecha: 2025-11-01",
+      "Incidente: Hoyo en el pavimento. Ubicación: Malecón Nuevo, Culiacán. Se requiere bacheo. Fecha: 2025-10-28",
+      "Incidente: Reporte de choque en alturas del sur. Ubicación: Alturas del Sur, Culiacán. Fecha: 2025-11-04",
+      "Incidente: Reporte de robo en alturas del sur. Ubicación: Alturas del Sur, Culiacán. Fecha: 2025-11-04",
+      "Incidente: Asalto en barrancos. Ubicación: Barrancos, Culiacán. Fecha: 2025-11-04"
+    ]
+    initial_documents = [Document(page_content=t) for t in initial_incidents]
     
-    # Securely read the API key from Streamlit secrets
-    try:
-        api_key = st.secrets["google_api_key"]
-    except KeyError:
-        raise KeyError("The 'google_api_key' is not configured in Streamlit secrets. Check your configuration!")
-
-    try:
-        # Pass the key to LangChain constructors
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key)
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key) 
-
-    except Exception as e:
-        raise ConnectionError(f"Google connection failed. Error: {e}")
-
-    # B. Vector Store (Load or Create ChromaDB)
-    if os.path.exists(PERSIST_DIRECTORY) and os.listdir(PERSIST_DIRECTORY):
-        # Load existing database
-        vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embeddings)
-    else:
-        # Create initial sample data
-        initial_incidents = [
-            "Incidente: Semáforo dañado. Ubicación: Av. Obregón, Culiacán. Fecha: 2025-11-01",
-            "Incidente: Hoyo en el pavimento. Ubicación: Malecón Nuevo, Culiacán. Se requiere bacheo. Fecha: 2025-10-28",
-            "Incidente: Reporte de choque en alturas del sur. Ubicación: Alturas del Sur, Culiacán. Fecha: 2025-11-04",
-            "Incidente: Reporte de robo en alturas del sur. Ubicación: Alturas del Sur, Culiacán. Fecha: 2025-11-04",
-            "Incidente: Asalto en barrancos. Ubicación: Barrancos, Culiacán. Fecha: 2025-11-04"
-        ]
-        initial_documents = [Document(page_content=t) for t in initial_incidents]
-        
-        vectorstore = Chroma.from_documents(
-            initial_documents, 
-            embedding=embeddings, 
-            persist_directory=PERSIST_DIRECTORY
-        )
-        vectorstore.persist() 
-    
-    # Configure retriever for similarity search
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5}) 
-    
-    return llm, vectorstore, retriever
-
+    vectorstore = Chroma.from_documents(
+      initial_documents, 
+      embedding=embeddings, 
+      persist_directory=PERSIST_DIRECTORY
+    )
+    vectorstore.persist() 
+  
+  # Configure retriever for similarity search
+  retriever = vectorstore.as_retriever(search_kwargs={"k": 5}) 
+  
+  return llm, vectorstore, retriever
 
 try:
+    # We call it without the decorator for the first time
     llm, vectorstore, retriever = initialize_system()
 except (KeyError, ConnectionError) as e:
     st.error(f"❌ ERROR CRÍTICO: {e}")
@@ -174,9 +174,13 @@ if choice in ('📝 Reportar Incidente', '🔍 Consultar Incidentes'):
                 current_date = datetime.now().strftime('%Y-%m-%d')
                 incident_report = f"Incidente: {user_input}. Ubicación: {ubicacion_detectada}. Fecha: {current_date}"
                 
-                with st.spinner('💾 Guardando reporte en ChromaDB...'):
+                with st.spinner('💾 Guardando reporte...'):
                     vectorstore.add_texts([incident_report])
                     vectorstore.persist() 
+                    
+                # a initialize_system
+                initialize_system.clear()
+                
                 st.success(f"✅ ¡Incidente reportado con éxito! Fecha: **{current_date}**")
 
             # --- Logic for Option 2: CONSULT ---
@@ -184,6 +188,7 @@ if choice in ('📝 Reportar Incidente', '🔍 Consultar Incidentes'):
                 st.subheader(f"Resultados de la consulta cerca de '{ubicacion_detectada}'")
                 
                 with st.spinner('🔍 Buscando reportes similares en la memoria...'):
+                    # Note: Retriever uses the current (possibly cached) vectorstore instance
                     retrieved_documents = retriever.invoke(user_input)
                 
                 if retrieved_documents:
@@ -219,6 +224,9 @@ elif choice == '📅 Ver Reportes Recientes':
     st.header("📅 Reportes Más Recientes (Top 10)")
     
     with st.spinner('⏳ Recuperando y ordenando todos los reportes...'):
+        # To ensure the most recent data is displayed, we must call initialize_system 
+        # again if the cache was cleared (which happens on next script run after reporting).
+        # We rely on Streamlit's rerun mechanism to update the data here.
         recent_reports = get_recent_reports(vectorstore, top_n=10)
     
     if recent_reports:
