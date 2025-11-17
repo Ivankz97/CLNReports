@@ -61,7 +61,6 @@ def initialize_system():
 
 try:
     llm, vectorstore, retriever = initialize_system()
-    st.sidebar.info("✅ Sistema y ChromaDB listos.")
 except (KeyError, ConnectionError) as e:
     st.error(f"❌ ERROR CRÍTICO: {e}")
     st.stop()
@@ -123,7 +122,6 @@ def get_recent_reports(vectorstore, top_n=10):
 # --- 3. Main Streamlit Logic ---
 
 st.title("🚨 Sistema de Gestión de Incidentes de Culiacán")
-st.markdown("Usa Gemini para la extracción y ChromaDB para la memoria persistente.")
 
 st.sidebar.header("Opciones")
 # Radio button for choosing action
@@ -132,7 +130,7 @@ choice = st.sidebar.radio("Elige una acción:", ('📝 Reportar Incidente', '�
 # --- Input Block (Applies only to Reporting/Consulting) ---
 if choice in ('📝 Reportar Incidente', '🔍 Consultar Incidentes'):
     user_input = st.text_area(
-        "Ingresa la descripción y ubicación del incidente", 
+        "Ingresa la descripción y ubicación del incidente (ej. Choque en Av. Obregón)", 
         key="main_input",
         height=100
     )
@@ -147,7 +145,7 @@ if choice in ('📝 Reportar Incidente', '🔍 Consultar Incidentes'):
         try:
             location_messages = [LOCATION_EXTRACTOR_ROLE, HumanMessage(content=user_input)]
             
-            with st.spinner('🌎 Buscando ubicación con Gemini...'):
+            with st.spinner('🌎 Buscando ubicación...'):
                 location_json_str = llm.invoke(location_messages).content
 
             # JSON cleaning and parsing logic
